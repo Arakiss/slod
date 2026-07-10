@@ -6,7 +6,10 @@ use std::{
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::trace::{EventKind, Trace};
+use crate::{
+    private_fs::write_private,
+    trace::{EventKind, Trace},
+};
 
 pub const LEDGER_VERSION: u16 = 1;
 
@@ -85,16 +88,9 @@ pub fn rebuild(dir: &Path, out: &Path) -> Result<Vec<LedgerEntry>> {
 }
 
 pub fn write(path: &Path, entries: &[LedgerEntry]) -> Result<()> {
-    if let Some(parent) = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-
     let content = render_jsonl(entries)?;
-    fs::write(path, content).with_context(|| format!("failed to write {}", path.display()))
+    write_private(path, content.as_bytes())
+        .with_context(|| format!("failed to write {}", path.display()))
 }
 
 pub fn read(path: &Path) -> Result<Vec<LedgerEntry>> {

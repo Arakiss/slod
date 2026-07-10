@@ -1,4 +1,5 @@
 use super::*;
+use crate::redaction::REDACTED;
 use serde_json::json;
 
 #[test]
@@ -68,6 +69,37 @@ fn maps_post_tool_use_to_tool_result() {
     assert_eq!(events[0].payload["success"], true);
     assert_eq!(events[0].payload["exit_code"], 0);
     assert_eq!(events[0].payload["output"], "ok");
+}
+
+#[test]
+fn maps_hook_payloads_with_recursive_structural_redaction() {
+    let events = map_hook_payload(
+        "generic",
+        &json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Http",
+            "tool_input": {
+                "command": "request synthetic fixture",
+                "credentials": {
+                    "clientSecret": "synthetic-client-secret",
+                    "access_token": "synthetic-access-token"
+                },
+                "headers": {
+                    "Authorization": "Bearer synthetic-authorization",
+                    "Accept": "application/json"
+                },
+                "metadata": {"fixture": true}
+            }
+        }),
+    )
+    .unwrap();
+
+    let input = &events[0].payload["input"];
+    assert_eq!(input["credentials"]["clientSecret"], REDACTED);
+    assert_eq!(input["credentials"]["access_token"], REDACTED);
+    assert_eq!(input["headers"]["Authorization"], REDACTED);
+    assert_eq!(input["headers"]["Accept"], "application/json");
+    assert_eq!(input["metadata"]["fixture"], true);
 }
 
 #[test]

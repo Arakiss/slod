@@ -1,6 +1,6 @@
 use std::{
     fmt,
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::{Read, Seek, Write},
     path::{Path, PathBuf},
     str::FromStr,
@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use time::OffsetDateTime;
 use uuid::Uuid;
+
+use crate::private_fs::{create_private_dir_all, private_open_options};
 
 pub const SLOD_VERSION: u16 = 1;
 
@@ -424,7 +426,8 @@ impl LockedTrace<'_> {
         }
         let event = Event::new(run_id, EventKind::RunStarted, 0, payload);
         let encoded = encode_event_line(&event)?;
-        let mut file = OpenOptions::new()
+        let mut options = private_open_options();
+        let mut file = options
             .create(true)
             .truncate(true)
             .write(true)
@@ -436,7 +439,8 @@ impl LockedTrace<'_> {
     }
 
     pub fn append(&self, kind: EventKind, payload: Value) -> Result<Event> {
-        let mut file = OpenOptions::new()
+        let mut options = private_open_options();
+        let mut file = options
             .read(true)
             .append(true)
             .open(self.path)
@@ -536,7 +540,7 @@ fn create_parent(path: &Path) -> Result<()> {
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
     {
-        fs::create_dir_all(parent)
+        create_private_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
     Ok(())
@@ -551,7 +555,8 @@ fn trace_lock_path(path: &Path) -> PathBuf {
 fn open_trace_lock(path: &Path) -> Result<File> {
     create_parent(path)?;
     let lock_path = trace_lock_path(path);
-    OpenOptions::new()
+    let mut options = private_open_options();
+    options
         .create(true)
         .truncate(false)
         .read(true)

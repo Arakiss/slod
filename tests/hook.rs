@@ -12,6 +12,9 @@ use predicates::prelude::*;
 use slod::trace::{Event, EventKind};
 use tempfile::tempdir;
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 mod common;
 use common::*;
 
@@ -204,6 +207,139 @@ fn hook_ingest_does_not_initialize_trace_for_invalid_payload() {
         .stderr(predicate::str::contains("invalid JSON payload"));
 
     assert!(!trace_path.exists());
+}
+
+#[test]
+fn hook_ingest_does_not_echo_sensitive_input_in_parse_errors() {
+    let dir = tempdir().unwrap();
+    let trace_path = dir.path().join("invalid.slod");
+    let synthetic_credential = "synthetic-error-api-key";
+    let malformed =
+        format!(r#"{{"hook_event_name":"PreToolUse","api_key":"{synthetic_credential}""#);
+
+    slod()
+        .args([
+            "hook",
+            "ingest",
+            "--run-id",
+            "invalid-run",
+            "--init-if-missing",
+            "--file",
+        ])
+        .arg(&trace_path)
+        .write_stdin(malformed)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid JSON payload"))
+        .stderr(predicate::str::contains(synthetic_credential).not());
+
+    assert!(!trace_path.exists());
+}
+
+#[test]
+fn hook_ingest_redacts_nested_credentials_before_persisting() {
+    let dir = tempdir().unwrap();
+    let runs = dir.path().join("runs");
+    let trace_path = runs.join("run-redaction-session.slod");
+    let sensitive_values = [
+        "synthetic-client-secret",
+        "synthetic-access-token",
+        "synthetic-password",
+        "synthetic-cookie",
+        "synthetic-authorization",
+        "synthetic-api-key",
+    ];
+
+    slod()
+        .args(["hook", "ingest", "--source", "generic", "--dir"])
+        .arg(&runs)
+        .write_stdin(
+            r#"{"hook_event_name":"PreToolUse","tool_name":"Http","session_id":"redaction-session","tool_input":{"command":"request synthetic fixture","client_secret":"synthetic-client-secret","accessToken":"synthetic-access-token","password":"synthetic-password","headers":{"Cookie":"synthetic-cookie","Authorization":"synthetic-authorization","X-API-Key":"synthetic-api-key","Accept":"application/json"},"metadata":{"fixture":"kept"}}}"#,
+        )
+        .assert()
+        .success();
+
+    let trace = fs::read_to_string(trace_path).unwrap();
+    for sensitive in sensitive_values {
+        assert!(
+            !trace.contains(sensitive),
+            "persisted trace contains a synthetic credential"
+        );
+    }
+    assert!(trace.contains("[REDACTED]"));
+    assert!(trace.contains("application/json"));
+    assert!(trace.contains(r#""fixture":"kept""#));
+}
+
+#[cfg(unix)]
+#[test]
+fn storage_creation_stays_private_with_a_permissive_umask() {
+    let dir = tempdir().unwrap();
+    let workspace = dir.path().join("workspace");
+    fs::create_dir(&workspace).unwrap();
+    let data_dir = workspace.join(".slod");
+    let runs = data_dir.join("runs");
+    let trace_path = runs.join("run-private-session.slod");
+    let lock_path = runs.join("run-private-session.slod.lock");
+
+    let mut child = StdCommand::new("sh")
+        .arg("-c")
+        .arg(
+            r#"umask 000
+exec "$SLOD_BIN" hook ingest --source generic --dir "$RUNS""#,
+        )
+        .env("SLOD_BIN", env!("CARGO_BIN_EXE_slod"))
+        .env("RUNS", &runs)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(
+            br#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"synthetic"},"session_id":"private-session"}"#,
+        )
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "hook ingest failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let catalog = data_dir.join("catalog");
+    let ledger = catalog.join("ledger.slod");
+    let output = StdCommand::new("sh")
+        .arg("-c")
+        .arg(
+            r#"umask 000
+exec "$SLOD_BIN" ledger rebuild --dir "$RUNS" --out "$LEDGER""#,
+        )
+        .env("SLOD_BIN", env!("CARGO_BIN_EXE_slod"))
+        .env("RUNS", &runs)
+        .env("LEDGER", &ledger)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "ledger rebuild failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert_eq!(unix_mode(&data_dir), 0o700);
+    assert_eq!(unix_mode(&runs), 0o700);
+    assert_eq!(unix_mode(&catalog), 0o700);
+    assert_eq!(unix_mode(&trace_path), 0o600);
+    assert_eq!(unix_mode(&lock_path), 0o600);
+    assert_eq!(unix_mode(&ledger), 0o600);
+}
+
+#[cfg(unix)]
+fn unix_mode(path: &Path) -> u32 {
+    fs::metadata(path).unwrap().permissions().mode() & 0o777
 }
 
 #[test]

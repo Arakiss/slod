@@ -8,7 +8,7 @@
 
 use std::{
     collections::HashMap,
-    fs::{self, File},
+    fs::File,
     io::{BufRead, BufReader},
     path::Path,
 };
@@ -17,6 +17,8 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
+
+use crate::private_fs::write_private;
 
 use crate::trace::{Event, EventKind, SLOD_VERSION};
 
@@ -559,19 +561,13 @@ pub fn write_trace(target: &Path, events: &[Event], force: bool) -> Result<()> {
             target.display()
         );
     }
-    if let Some(parent) = target
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
     let mut out = String::new();
     for event in events {
         out.push_str(&serde_json::to_string(event)?);
         out.push('\n');
     }
-    fs::write(target, out).with_context(|| format!("failed to write {}", target.display()))?;
+    write_private(target, out.as_bytes())
+        .with_context(|| format!("failed to write {}", target.display()))?;
     Ok(())
 }
 

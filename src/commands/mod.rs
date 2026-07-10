@@ -21,7 +21,7 @@ pub mod verify;
 pub(crate) const OUTPUT_PREVIEW_CHARS: usize = 4_000;
 
 pub(crate) fn parse_payload(payload: &str) -> Result<Value> {
-    serde_json::from_str(payload).with_context(|| format!("invalid JSON payload: {payload}"))
+    serde_json::from_str(payload).context("invalid JSON payload")
 }
 
 pub(crate) fn print_action(action: &str, fields: &[(&str, String)]) {

@@ -1,7 +1,7 @@
 use anyhow::{Result, bail};
 use serde_json::{Map, Value};
 
-use crate::trace::EventKind;
+use crate::{redaction::redact, trace::EventKind};
 
 /// Default source label recorded when a host hook does not name itself.
 pub const DEFAULT_SOURCE: &str = "generic";
@@ -70,6 +70,8 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
 }
 
 pub fn map_hook_payload(source: &str, payload: &Value) -> Result<Vec<HookEvent>> {
+    let payload = redact(payload);
+    let payload = &payload;
     let Some(object) = payload.as_object() else {
         bail!("hook payload must be a JSON object");
     };

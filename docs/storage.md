@@ -27,6 +27,27 @@ agents decide where a trace belongs. For one-command dogfooding, `slod run`
 can also create a default trace under `.slod/runs/` when `--file` is not
 provided.
 
+## Local confidentiality
+
+On Unix, Slod creates trace data directories with mode `0700` and trace,
+coordination-lock, imported-trace, and ledger files with mode `0600`. These
+modes are requested at creation time, so a permissive process umask cannot
+briefly expose new trace data before a later permission change. Slod does not
+change the modes of pre-existing paths solely because it opens them.
+
+Host hook payloads pass through deterministic recursive redaction before they
+become trace events. Keys such as `secret`, `token`, `password`, `cookie`,
+`authorization`, and `api-key` are matched case-insensitively across common
+snake-case, kebab-case, and camel-case forms. Sensitive HTTP header values are
+also replaced in both header maps and name/value header lists. Other fields and
+array order are preserved.
+
+Redaction is structural. Slod does not attempt to parse arbitrary shell command
+strings or provider-specific free-form text for embedded credentials. Hosts
+should pass credentials in named fields or headers and avoid embedding them in
+commands. Parse failures report the JSON error without echoing the submitted
+payload.
+
 ## Concurrent access and lock sidecars
 
 Each trace has a sibling coordination file named `<trace>.lock`. Slod may leave

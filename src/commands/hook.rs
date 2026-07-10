@@ -10,6 +10,7 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Map, Value, json};
 use slod::{
     hook::{derive_run_id, map_hook_payload, normalize_source},
+    redaction::redact,
     trace::{EventKind, Trace},
 };
 
@@ -33,7 +34,7 @@ pub(crate) fn ingest(
         bail!("missing hook JSON on stdin");
     }
 
-    let payload = parse_payload(&input)?;
+    let payload = redact(&parse_payload(&input)?);
     let events = map_hook_payload(&source, &payload)?;
 
     // The effective run id is the explicit --run-id, or one derived from the
@@ -47,11 +48,7 @@ pub(crate) fn ingest(
     // session trace on first use. `--file` keeps the explicit `--init-if-missing`
     // gate but no longer fails for a missing `--run-id` (it derives one).
     let (trace_file, create_if_missing): (PathBuf, bool) = match (dir, file) {
-        (Some(dir), None) => {
-            fs::create_dir_all(dir)
-                .with_context(|| format!("failed to create {}", dir.display()))?;
-            (dir.join(format!("{effective_run_id}.slod")), true)
-        }
+        (Some(dir), None) => (dir.join(format!("{effective_run_id}.slod")), true),
         (None, Some(file)) => (file.to_path_buf(), init_if_missing),
         (Some(_), Some(_)) => bail!("pass exactly one of --file or --dir, not both"),
         (None, None) => bail!("pass exactly one of --file or --dir"),
