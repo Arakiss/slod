@@ -6,6 +6,11 @@ use crate::trace::EventKind;
 /// Default source label recorded when a host hook does not name itself.
 pub const DEFAULT_SOURCE: &str = "generic";
 
+/// Maximum number of bytes of host-reported stderr kept on a `tool.result`.
+/// Enough to identify why a command failed, small enough that a trace does not
+/// become a second copy of every command's error stream.
+pub const STDERR_CAPTURE_BYTES: usize = 500;
+
 /// Normalize a free-form `--source` label. Slod never hardcodes the names
 /// of specific agent harnesses: the label is an opaque string the host chooses,
 /// trimmed and stored verbatim on every mapped event. An empty label falls back
@@ -169,35 +174,26 @@ fn map_tool_call(source: &str, hook_event: &str, payload: &Value) -> HookEvent {
 }
 
 fn map_tool_result(source: &str, hook_event: &str, payload: &Value) -> HookEvent {
-    let exit_code = value_field(
-        payload,
-        &[
-            "exit_code",
-            "exitCode",
-            "tool_response.exit_code",
-            "result.exit_code",
-        ],
-    );
-    let success = bool_field(
-        payload,
-        &[
-            "success",
-            "tool_response.success",
-            "result.success",
-            "ok",
-            "status.success",
-        ],
-    )
-    .or_else(|| exit_code.as_ref().and_then(value_exit_success))
-    .unwrap_or_else(|| {
-        string_field(payload, &["error", "tool_response.error", "result.error"]).is_none()
-    });
+    let outcome = tool_outcome(payload);
 
     let mut out = base_payload(source, hook_event);
     insert_string(&mut out, "tool", infer_tool(payload));
     insert_string(&mut out, "command", infer_command(payload));
-    out.insert("success".to_string(), Value::Bool(success));
-    insert_value(&mut out, "exit_code", exit_code);
+    // Three-state outcome. `null` means the host reported nothing we can read,
+    // and is recorded as such: a trace that claims success because no field
+    // said otherwise is worse than one that admits it does not know.
+    out.insert(
+        "success".to_string(),
+        match outcome.success {
+            Some(success) => Value::Bool(success),
+            None => Value::Null,
+        },
+    );
+    out.insert(
+        "outcome_source".to_string(),
+        Value::String(outcome.source.to_string()),
+    );
+    insert_value(&mut out, "exit_code", outcome.exit_code);
     insert_value(
         &mut out,
         "duration_ms",
@@ -207,10 +203,15 @@ fn map_tool_result(source: &str, hook_event: &str, payload: &Value) -> HookEvent
                 "duration_ms",
                 "durationMs",
                 "tool_response.duration_ms",
+                "tool_response.durationMs",
+                "tool_response.metadata.duration_ms",
                 "result.duration_ms",
             ],
         ),
     );
+    // A host that renders the result as text instead of a structured object
+    // puts everything the reader needs — including why a command failed — in
+    // that text, so it is the output when no structured one is offered.
     insert_value(
         &mut out,
         "output",
@@ -221,22 +222,221 @@ fn map_tool_result(source: &str, hook_event: &str, payload: &Value) -> HookEvent
                 "stdout",
                 "tool_response.output",
                 "tool_response.stdout",
+                "tool_response.stdout.text",
+                "tool_response.aggregated_output",
+                "tool_response.aggregated_output.text",
                 "result.output",
                 "result.stdout",
             ],
-        ),
+        )
+        .or_else(|| response_text(payload).map(Value::String)),
     );
-    insert_string(
-        &mut out,
-        "error",
-        string_field(payload, &["error", "tool_response.error", "result.error"]),
-    );
+    insert_string(&mut out, "stderr", stderr_capture(payload));
+    insert_string(&mut out, "error", error_text(payload));
     insert_host_context(&mut out, payload);
 
     HookEvent {
         kind: EventKind::ToolResult,
         payload: Value::Object(out),
     }
+}
+
+/// A tool outcome as the host actually reported it.
+///
+/// `success` is three-state on purpose. `Some(true)`/`Some(false)` mean a field
+/// in the payload said so; `None` means no field did, and the caller must
+/// record `null` rather than invent a verdict. `source` names the field that
+/// decided it so a reader can tell a measured outcome from an absent one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolOutcome {
+    pub success: Option<bool>,
+    pub exit_code: Option<Value>,
+    pub source: &'static str,
+}
+
+const SUCCESS_PATHS: &[&str] = &[
+    "success",
+    "tool_response.success",
+    "result.success",
+    "ok",
+    "status.success",
+];
+const IS_ERROR_PATHS: &[&str] = &[
+    "is_error",
+    "isError",
+    "tool_response.is_error",
+    "tool_response.isError",
+    "result.is_error",
+];
+const INTERRUPTED_PATHS: &[&str] = &[
+    "interrupted",
+    "tool_response.interrupted",
+    "result.interrupted",
+];
+const TIMED_OUT_PATHS: &[&str] = &[
+    "timed_out",
+    "timedOut",
+    "tool_response.timed_out",
+    "tool_response.timedOut",
+];
+const EXIT_CODE_PATHS: &[&str] = &[
+    "exit_code",
+    "exitCode",
+    "tool_response.exit_code",
+    "tool_response.exitCode",
+    "tool_response.metadata.exit_code",
+    "result.exit_code",
+];
+const ERROR_PATHS: &[&str] = &["error", "tool_response.error", "result.error"];
+const RESPONSE_TEXT_PATHS: &[&str] = &["tool_response", "toolResponse", "result"];
+
+/// Resolve the outcome of a tool result payload without ever defaulting to
+/// success.
+///
+/// Negative signals are read first: a host that says a call errored, was
+/// interrupted, or timed out has settled the question, whatever else the
+/// payload claims. Only then do we read an explicit success flag, an exit
+/// code, an exit code embedded in a textual response, or an error message.
+/// Anything else is unknown.
+///
+/// Deliberately *not* a failure signal: a non-empty stderr. Well-behaved
+/// commands write progress and warnings to stderr and exit 0, so stderr is
+/// captured as evidence (see [`STDERR_CAPTURE_BYTES`]) but never used as a
+/// verdict.
+pub fn tool_outcome(payload: &Value) -> ToolOutcome {
+    let exit_code = value_field(payload, EXIT_CODE_PATHS);
+
+    for (paths, source) in [
+        (IS_ERROR_PATHS, "is_error"),
+        (INTERRUPTED_PATHS, "interrupted"),
+        (TIMED_OUT_PATHS, "timed_out"),
+    ] {
+        if bool_field(payload, paths) == Some(true) {
+            return ToolOutcome {
+                success: Some(false),
+                exit_code,
+                source,
+            };
+        }
+    }
+
+    if let Some(success) = bool_field(payload, SUCCESS_PATHS) {
+        return ToolOutcome {
+            success: Some(success),
+            exit_code,
+            source: "success",
+        };
+    }
+
+    // An explicit `is_error: false` is the host asserting the call did not
+    // error. `interrupted: false` is not: it only rules out an interruption,
+    // and says nothing about the exit status.
+    if bool_field(payload, IS_ERROR_PATHS) == Some(false) {
+        return ToolOutcome {
+            success: Some(true),
+            exit_code,
+            source: "is_error",
+        };
+    }
+
+    if let Some(success) = exit_code.as_ref().and_then(value_exit_success) {
+        return ToolOutcome {
+            success: Some(success),
+            exit_code,
+            source: "exit_code",
+        };
+    }
+
+    if let Some(code) = response_text(payload)
+        .as_deref()
+        .and_then(exit_code_in_text)
+    {
+        return ToolOutcome {
+            success: Some(code == 0),
+            exit_code: Some(Value::from(code)),
+            source: "response_text",
+        };
+    }
+
+    if error_text(payload).is_some() {
+        return ToolOutcome {
+            success: Some(false),
+            exit_code,
+            source: "error",
+        };
+    }
+
+    ToolOutcome {
+        success: None,
+        exit_code,
+        source: "none",
+    }
+}
+
+fn error_text(payload: &Value) -> Option<String> {
+    string_field(payload, ERROR_PATHS)
+}
+
+/// The tool response when the host hands back rendered text instead of a
+/// structured object.
+fn response_text(payload: &Value) -> Option<String> {
+    RESPONSE_TEXT_PATHS
+        .iter()
+        .find_map(|path| match value_at(payload, path) {
+            Some(Value::String(text)) if !text.trim().is_empty() => Some(text.to_string()),
+            _ => None,
+        })
+}
+
+/// Read an exit status out of a textual tool response.
+///
+/// Hosts that render a result for the model still put the exit status in the
+/// first line of it; `Error: Exit code 127` and `Exit code: 127` are both in
+/// use. Only the first non-empty line is scanned, so the phrase appearing
+/// later inside captured output cannot be mistaken for the status.
+fn exit_code_in_text(text: &str) -> Option<i64> {
+    const NEEDLE: &str = "exit code";
+
+    let line = text.lines().find(|line| !line.trim().is_empty())?;
+    let position = line.to_ascii_lowercase().find(NEEDLE)?;
+    let rest = line.get(position + NEEDLE.len()..)?;
+    let digits = rest
+        .chars()
+        .skip_while(|ch| *ch == ':' || ch.is_whitespace())
+        .take_while(|ch| ch.is_ascii_digit() || *ch == '-')
+        .collect::<String>();
+    digits.parse::<i64>().ok()
+}
+
+/// The first [`STDERR_CAPTURE_BYTES`] of whatever the host reported on stderr.
+fn stderr_capture(payload: &Value) -> Option<String> {
+    let text = string_field(
+        payload,
+        &[
+            "stderr",
+            "tool_response.stderr",
+            "tool_response.stderr.text",
+            "tool_response.metadata.stderr",
+            "result.stderr",
+        ],
+    )?;
+    if text.trim().is_empty() {
+        return None;
+    }
+    Some(truncate_bytes(&text, STDERR_CAPTURE_BYTES))
+}
+
+/// Truncate on a character boundary at or below `limit` bytes, marking the cut
+/// so a reader never mistakes a clipped message for the whole one.
+fn truncate_bytes(text: &str, limit: usize) -> String {
+    if text.len() <= limit {
+        return text.to_string();
+    }
+    let mut end = limit;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}\n[truncated]", &text[..end])
 }
 
 fn map_error(source: &str, hook_event: &str, payload: &Value) -> HookEvent {
