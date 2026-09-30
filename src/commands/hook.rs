@@ -93,6 +93,166 @@ pub(crate) fn ingest(
     Ok(())
 }
 
+/// Close the trace of a finished host session with a `run.finished` event.
+///
+/// Wired on the host's session-ending hook, this is what makes `slod verify`
+/// (which requires a closed trace) pass on real captured sessions. It reads the
+/// same hook payload shape `ingest` does and derives the same run id, so the
+/// hook needs no knowledge of where the trace lives.
+///
+/// Three properties matter for a hook that runs unattended:
+///
+/// * **Idempotent.** A trace that is already closed is left alone, and closing
+///   is reported as a no-op rather than an error.
+/// * **Silent on absence.** A session that never triggered an ingest has no
+///   trace; there is nothing to close and that is not a failure.
+/// * **Never creates.** Unlike `ingest --dir`, close never initializes a trace.
+///
+/// The `run.finished` payload carries an outcome census of the trace it closes,
+/// including how many `tool.call` events never received a `tool.result`. That
+/// asymmetry is the only failure signal available from a host that drops its
+/// post-tool hook when a tool fails, so it is recorded explicitly instead of
+/// being left for every reader to recompute.
+pub(crate) fn close(
+    file: Option<&Path>,
+    dir: Option<&Path>,
+    source: &str,
+    run_id: Option<&str>,
+    status: &str,
+) -> Result<()> {
+    let source = normalize_source(source);
+    let mut input = String::new();
+    io::stdin()
+        .read_to_string(&mut input)
+        .context("failed to read hook payload from stdin")?;
+    if input.trim().is_empty() {
+        bail!("missing hook JSON on stdin");
+    }
+
+    let payload = parse_payload(&input)?;
+    if !payload.is_object() {
+        bail!("hook payload must be a JSON object");
+    }
+
+    let effective_run_id = run_id
+        .map(str::to_string)
+        .unwrap_or_else(|| derive_run_id(&payload));
+
+    let trace_file: PathBuf = match (dir, file) {
+        (Some(dir), None) => dir.join(format!("{effective_run_id}.slod")),
+        (None, Some(file)) => file.to_path_buf(),
+        (Some(_), Some(_)) => bail!("pass exactly one of --file or --dir, not both"),
+        (None, None) => bail!("pass exactly one of --file or --dir"),
+    };
+
+    if !trace_file.exists() {
+        print_action(
+            "hook close",
+            &[
+                ("file", trace_file.display().to_string()),
+                ("result", "no trace for this session".to_string()),
+            ],
+        );
+        return Ok(());
+    }
+
+    let outcome = Trace::with_exclusive(&trace_file, |trace| {
+        if !trace.exists() {
+            return Ok(None);
+        }
+        let existing = trace.read()?;
+        if existing
+            .events
+            .last()
+            .is_some_and(|event| event.kind == EventKind::RunFinished)
+        {
+            return Ok(None);
+        }
+
+        let mut finished = json!({
+            "status": status,
+            "source": source,
+            "outcomes": census(&existing),
+        });
+        let object = finished
+            .as_object_mut()
+            .expect("run.finished payload is an object");
+        if let Some(hook_event) = string_at(&payload, "hook_event_name") {
+            object.insert("hook_event".to_string(), Value::String(hook_event));
+        }
+        if let Some(reason) = string_at(&payload, "reason") {
+            object.insert("reason".to_string(), Value::String(reason));
+        }
+
+        trace.append(EventKind::RunFinished, finished).map(Some)
+    })?;
+
+    let result = match &outcome {
+        Some(event) => format!("closed at {}#{}", event.kind, event.seq),
+        None => "already closed".to_string(),
+    };
+    print_action(
+        "hook close",
+        &[
+            ("file", trace_file.display().to_string()),
+            ("source", source),
+            ("status", status.to_string()),
+            ("result", result),
+        ],
+    );
+    Ok(())
+}
+
+/// Count what the trace being closed actually recorded.
+///
+/// `unanswered_calls` is the interesting one: a `tool.call` with no matching
+/// `tool.result`. Hosts that simply do not fire their post-tool hook when a
+/// tool errors leave exactly this shape behind, so the count is a lower bound
+/// on failures even when every delivered result is inconclusive.
+fn census(trace: &Trace) -> Value {
+    let mut calls = 0_u64;
+    let mut results = 0_u64;
+    let mut succeeded = 0_u64;
+    let mut failed = 0_u64;
+    let mut unknown = 0_u64;
+    let mut errors = 0_u64;
+
+    for event in &trace.events {
+        match event.kind {
+            EventKind::ToolCall => calls += 1,
+            EventKind::ToolResult => {
+                results += 1;
+                match event.payload.get("success") {
+                    Some(Value::Bool(true)) => succeeded += 1,
+                    Some(Value::Bool(false)) => failed += 1,
+                    _ => unknown += 1,
+                }
+            }
+            EventKind::Error => errors += 1,
+            _ => {}
+        }
+    }
+
+    json!({
+        "tool_calls": calls,
+        "tool_results": results,
+        "unanswered_calls": calls.saturating_sub(results),
+        "succeeded": succeeded,
+        "failed": failed,
+        "unknown": unknown,
+        "errors": errors,
+    })
+}
+
+fn string_at(payload: &Value, key: &str) -> Option<String> {
+    payload
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
+}
+
 /// Wire an agent host so it pipes hook payloads into `slod hook ingest`.
 ///
 /// The wiring is written to a local hooks file (default `.agent/hooks.json`) in

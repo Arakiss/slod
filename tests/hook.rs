@@ -744,3 +744,196 @@ fn hook_ingest_maps_pre_and_post_tool_use_payloads() {
         .stdout(predicate::str::contains("tool_calls: 1"))
         .stdout(predicate::str::contains("tool_results: 1"));
 }
+
+/// Both outcomes, end to end, through the binary a host hook runs: a failing
+/// shell result must land as `success:false` and a succeeding one as
+/// `success:true`. The payloads are the shapes the two primary harnesses emit
+/// — a rendered `Error: Exit code N` string, and a structured exec result.
+#[test]
+fn hook_ingest_records_failing_and_succeeding_results_honestly() {
+    let dir = tempdir().unwrap();
+    let runs = dir.path().join("runs");
+
+    let ingest = |source: &str, payload: &str| {
+        slod()
+            .args(["hook", "ingest", "--source", source, "--dir"])
+            .arg(&runs)
+            .write_stdin(payload.to_string())
+            .assert()
+            .success();
+    };
+
+    ingest(
+        "claude-code",
+        r#"{"session_id":"outcomes","cwd":"/tmp/ws","hook_event_name":"PostToolUse","tool_name":"Bash","tool_input":{"command":"nope"},"tool_response":"Error: Exit code 127\nzsh: command not found: nope"}"#,
+    );
+    ingest(
+        "codex",
+        r#"{"session_id":"outcomes","cwd":"/tmp/ws","hook_event_name":"PostToolUse","tool_name":"Bash","tool_input":{"command":"echo hola"},"tool_response":{"exit_code":0,"stdout":{"text":"hola"},"stderr":{"text":""},"timed_out":false}}"#,
+    );
+
+    let trace_path = runs.join("run-outcomes.slod");
+    let trace = fs::read_to_string(&trace_path).unwrap();
+    assert!(
+        trace.contains(r#""success":false"#),
+        "a failed command must be recorded as a failure:\n{trace}"
+    );
+    assert!(trace.contains(r#""exit_code":127"#));
+    assert!(trace.contains("command not found: nope"));
+    assert!(
+        trace.contains(r#""success":true"#),
+        "a succeeding command must still be recorded as a success:\n{trace}"
+    );
+
+    slod()
+        .args(["summary", "--file"])
+        .arg(&trace_path)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("tool_failures: 1"));
+}
+
+/// A host result that reports nothing readable is recorded as unknown, not as
+/// a success. This is the whole point of the three-state outcome.
+#[test]
+fn hook_ingest_records_an_unreported_outcome_as_null() {
+    let dir = tempdir().unwrap();
+    let runs = dir.path().join("runs");
+
+    slod()
+        .args(["hook", "ingest", "--source", "claude-code", "--dir"])
+        .arg(&runs)
+        .write_stdin(
+            r#"{"session_id":"silent","hook_event_name":"PostToolUse","tool_name":"Bash","tool_input":{"command":"rg mani"},"tool_response":{"stdout":"hit","stderr":"","interrupted":false,"isImage":false}}"#
+                .to_string(),
+        )
+        .assert()
+        .success();
+
+    let trace = fs::read_to_string(runs.join("run-silent.slod")).unwrap();
+    assert!(trace.contains(r#""success":null"#), "{trace}");
+    assert!(trace.contains(r#""outcome_source":"none""#));
+    assert!(!trace.contains(r#""success":true"#));
+}
+
+/// `hook close` is what makes `slod verify` pass on a captured session: the
+/// trace gains its run.finished, and the run.finished carries the census of
+/// what was captured, including calls that never got a result.
+#[test]
+fn hook_close_finishes_a_captured_session_and_verify_passes() {
+    let dir = tempdir().unwrap();
+    let runs = dir.path().join("runs");
+
+    let ingest = |payload: &str| {
+        slod()
+            .args(["hook", "ingest", "--source", "claude-code", "--dir"])
+            .arg(&runs)
+            .write_stdin(payload.to_string())
+            .assert()
+            .success();
+    };
+
+    // Two calls, one answered: the unanswered one is the failure signal a host
+    // that drops PostToolUse on error leaves behind.
+    ingest(
+        r#"{"session_id":"closing","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"echo one"}}"#,
+    );
+    ingest(
+        r#"{"session_id":"closing","hook_event_name":"PostToolUse","tool_name":"Bash","tool_input":{"command":"echo one"},"tool_response":{"exit_code":0,"stdout":"one"}}"#,
+    );
+    ingest(
+        r#"{"session_id":"closing","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"boom"}}"#,
+    );
+
+    let trace_path = runs.join("run-closing.slod");
+
+    // Open traces are rejected by verify until the session is closed.
+    slod()
+        .args(["verify", "--file"])
+        .arg(&trace_path)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("last event must be run.finished"));
+
+    slod()
+        .args(["hook", "close", "--source", "claude-code", "--dir"])
+        .arg(&runs)
+        .write_stdin(
+            r#"{"session_id":"closing","hook_event_name":"SessionEnd","reason":"clear","cwd":"/tmp/ws"}"#
+                .to_string(),
+        )
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("closed at run.finished#"));
+
+    slod()
+        .args(["verify", "--file"])
+        .arg(&trace_path)
+        .assert()
+        .success();
+
+    let trace = fs::read_to_string(&trace_path).unwrap();
+    assert!(trace.contains(r#""kind":"run.finished""#));
+    assert!(trace.contains(r#""unanswered_calls":1"#), "{trace}");
+    assert!(trace.contains(r#""tool_calls":2"#));
+    assert!(trace.contains(r#""hook_event":"SessionEnd""#));
+    assert!(trace.contains(r#""reason":"clear""#));
+
+    // Closing again is a no-op, not an error: a session-end hook may fire twice.
+    slod()
+        .args(["hook", "close", "--source", "claude-code", "--dir"])
+        .arg(&runs)
+        .write_stdin(r#"{"session_id":"closing","hook_event_name":"SessionEnd"}"#.to_string())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("already closed"));
+
+    let after = fs::read_to_string(&trace_path).unwrap();
+    assert_eq!(
+        after.matches(r#""kind":"run.finished""#).count(),
+        1,
+        "closing twice must not append a second run.finished"
+    );
+}
+
+/// A session that never triggered an ingest has no trace. Closing it is a
+/// no-op, never a failure, because the hook runs on every session.
+#[test]
+fn hook_close_without_a_trace_is_not_an_error() {
+    let dir = tempdir().unwrap();
+    let runs = dir.path().join("runs");
+
+    slod()
+        .args(["hook", "close", "--source", "claude-code", "--dir"])
+        .arg(&runs)
+        .write_stdin(
+            r#"{"session_id":"never-captured","hook_event_name":"SessionEnd"}"#.to_string(),
+        )
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("no trace for this session"));
+
+    assert!(!runs.join("run-never-captured.slod").exists());
+}
+
+#[test]
+fn hook_close_rejects_empty_stdin_and_ambiguous_targets() {
+    let dir = tempdir().unwrap();
+
+    slod()
+        .args(["hook", "close", "--dir"])
+        .arg(dir.path())
+        .write_stdin("")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("missing hook JSON on stdin"));
+
+    slod()
+        .args(["hook", "close"])
+        .write_stdin(r#"{"session_id":"x"}"#.to_string())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "pass exactly one of --file or --dir",
+        ));
+}

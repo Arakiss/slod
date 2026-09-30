@@ -13,6 +13,7 @@ pub mod import;
 pub mod ledger;
 pub mod lifecycle;
 pub mod policy;
+pub mod prune;
 pub mod report;
 pub mod verify;
 

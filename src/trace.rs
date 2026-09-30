@@ -435,6 +435,15 @@ impl LockedTrace<'_> {
         Ok(())
     }
 
+    /// Read the trace while the exclusive lock is already held.
+    ///
+    /// [`Trace::read`] would take the shared lock a second time from the same
+    /// process and block against the exclusive one we are holding, so callers
+    /// inside [`Trace::with_exclusive`] must use this instead.
+    pub fn read(&self) -> Result<Trace> {
+        Trace::read_unlocked(self.path)
+    }
+
     pub fn append(&self, kind: EventKind, payload: Value) -> Result<Event> {
         let mut file = OpenOptions::new()
             .read(true)

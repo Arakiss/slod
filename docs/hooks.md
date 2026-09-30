@@ -130,8 +130,44 @@ Tool result (`PostToolUse`):
 ```
 
 The adapter also accepts a `success`/`stdout`/`duration_ms` result shape from
-other hosts; when only an exit code is present it derives success from
-`tool_response.exit_code`.
+other hosts, and a `tool_response` that is a rendered string rather than an
+object.
+
+## Outcomes are three-state
+
+`success` on a `tool.result` is `true`, `false`, or `null`. `null` means the
+host reported nothing slod can read, and it is recorded as `null` rather than
+`true`: a store where every result claims success cannot answer the one
+question it exists for. Every `tool.result` also carries `outcome_source`,
+naming the field that decided the verdict, so a reader can tell a measured
+outcome from an absent one.
+
+The resolution order is:
+
+| Signal read | Verdict | `outcome_source` |
+| --- | --- | --- |
+| `is_error`, `interrupted` or `timed_out` is true | failure | that field |
+| `success` / `ok` / `status.success` | as stated | `success` |
+| `is_error` is false | success | `is_error` |
+| `exit_code` (any of the probed paths) | zero is success | `exit_code` |
+| `Exit code: N` / `Error: Exit code N` in the first line of a textual response | zero is success | `response_text` |
+| a non-empty `error` message | failure | `error` |
+| nothing above | unknown (`null`) | `none` |
+
+Two deliberate omissions:
+
+- **A non-empty stderr is not a failure.** Well-behaved commands write progress
+  and warnings to stderr and exit 0. Stderr is captured as evidence — the first
+  500 bytes, truncated on a character boundary and marked `[truncated]` — but
+  never used as a verdict.
+- **`interrupted: false` is not a success.** It rules out an interruption and
+  says nothing about the exit status. Only `is_error: false` is a host
+  asserting the call did not fail.
+
+A consequence worth knowing before reading a store: some hosts do not fire
+their post-tool hook at all when a tool fails. Those failures never reach
+`hook ingest` in any shape, and show up instead as a `tool.call` with no
+matching `tool.result`. `hook close` counts exactly that (see below).
 
 Permission decision:
 
@@ -212,6 +248,70 @@ wrapper or by piping host payloads into `hook ingest` directly instead.
 When a host's settings file is global or otherwise delicate, prefer
 `hook install --print` and paste the printed snippet by hand. Slod never
 writes a file in `--print` mode.
+
+## Closing a captured session
+
+`hook ingest` is forbidden from creating lifecycle events, so a trace built
+only from tool hooks never gets its `run.finished` and `slod verify` rejects
+it. `slod hook close` is the other half of the wiring:
+
+```bash
+slod hook close --source generic --dir .slod/runs
+```
+
+It reads the session-ending hook payload from stdin and derives the run id the
+same way `ingest` does, so the wired command needs no knowledge of where the
+trace lives. It is safe to run unattended:
+
+- an already closed trace is left alone and reported as `already closed`;
+- a session that never triggered an ingest has no trace, which is reported and
+  is not an error;
+- it never creates a trace.
+
+**Wire it on a session-ending hook, never on a per-turn one.** Closing a trace
+forbids further appends, so a hook that fires at the end of every turn (`Stop`
+on most harnesses) would end capture at the first turn. `SessionEnd` is the
+event to use.
+
+The `run.finished` payload carries a census of the trace it closes:
+
+```json
+{
+  "status": "closed",
+  "source": "generic",
+  "hook_event": "SessionEnd",
+  "outcomes": {
+    "tool_calls": 2,
+    "tool_results": 1,
+    "unanswered_calls": 1,
+    "succeeded": 1,
+    "failed": 0,
+    "unknown": 0,
+    "errors": 0
+  }
+}
+```
+
+`unanswered_calls` is the one that earns its place: it is the count of
+`tool.call` events that never received a `tool.result`, which is the only
+failure signal available from a host that drops its post-tool hook when a tool
+fails.
+
+## Retention
+
+A capture store that only ever grows stops being local-first the day it fills
+the disk. `slod prune` drops traces outside a retention window:
+
+```bash
+slod prune --dir .slod/runs --older-than 30
+```
+
+It is a **dry run by default**: it reports how many traces and lock sidecars it
+would remove and how much that frees, then exits without touching anything.
+Pass `--apply` to actually delete. It only ever considers regular files named
+`*.slod` and `*.slod.lock` directly inside `--dir`; it never recurses, never
+removes `ledger.slod`, and leaves foreign files alone. Lock sidecars whose
+trace is already gone are removed at any age.
 
 ## Auditing a trace against policy
 

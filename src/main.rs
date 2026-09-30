@@ -135,6 +135,21 @@ enum Command {
         #[command(subcommand)]
         command: LedgerCommand,
     },
+    /// Drop traces older than a retention window (dry run unless --apply).
+    ///
+    /// Reports what it would remove and exits without touching anything. Pass
+    /// `--apply` to actually delete. Only regular `*.slod` files and their
+    /// `*.slod.lock` sidecars directly inside `--dir` are ever considered.
+    Prune {
+        #[arg(long, default_value = ".slod/runs")]
+        dir: PathBuf,
+        /// Retention window in days; traces last modified before it are dropped.
+        #[arg(long, value_name = "DAYS")]
+        older_than: u64,
+        /// Perform the deletion instead of reporting it.
+        #[arg(long, default_value_t = false)]
+        apply: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -158,6 +173,30 @@ enum HookCommand {
         run_id: Option<String>,
         #[arg(long, default_value_t = false)]
         init_if_missing: bool,
+    },
+    /// Close the trace of a finished host session with a `run.finished` event.
+    ///
+    /// Reads the session-ending hook payload from stdin and derives the run id
+    /// the same way `ingest` does. Idempotent: an already closed trace is left
+    /// alone, and a session that never produced a trace is not an error.
+    ///
+    /// Wire this on the host's *session*-ending hook (`SessionEnd`), never on a
+    /// per-turn one (`Stop`): closing a trace forbids further appends, so a
+    /// per-turn hook would end capture at the first turn.
+    Close {
+        /// Trace file to close (mutually exclusive with --dir).
+        #[arg(long)]
+        file: Option<PathBuf>,
+        /// Per-session run directory; the trace is <dir>/<run_id>.slod.
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        #[arg(long, default_value = "generic")]
+        source: String,
+        #[arg(long)]
+        run_id: Option<String>,
+        /// Status recorded on the run.finished event.
+        #[arg(long, default_value = "closed")]
+        status: String,
     },
     /// Wire an agent host so it pipes hook payloads into `slod hook ingest`.
     ///
@@ -275,6 +314,19 @@ fn main() -> Result<()> {
                 run_id.as_deref(),
                 init_if_missing,
             )?,
+            HookCommand::Close {
+                file,
+                dir,
+                source,
+                run_id,
+                status,
+            } => commands::hook::close(
+                file.as_deref(),
+                dir.as_deref(),
+                &source,
+                run_id.as_deref(),
+                &status,
+            )?,
             HookCommand::Install {
                 file,
                 source,
@@ -293,6 +345,11 @@ fn main() -> Result<()> {
             LedgerCommand::Show { file, run_id } => commands::ledger::show(&file, &run_id)?,
             LedgerCommand::Export { file, jsonl } => commands::ledger::export(&file, jsonl)?,
         },
+        Command::Prune {
+            dir,
+            older_than,
+            apply,
+        } => commands::prune::prune(&dir, older_than, apply)?,
     }
 
     Ok(())

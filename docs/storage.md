@@ -27,6 +27,41 @@ agents decide where a trace belongs. For one-command dogfooding, `slod run`
 can also create a default trace under `.slod/runs/` when `--file` is not
 provided.
 
+## What a `tool.result` payload records
+
+The outcome field is three-state and is never inferred optimistically:
+
+| Field | Meaning |
+| --- | --- |
+| `success` | `true`, `false`, or `null` when the host reported nothing readable |
+| `outcome_source` | the field that decided `success`, or `"none"` |
+| `exit_code` | the exit status when the host reported one |
+| `duration_ms` | wall time when the host reported one |
+| `output` | the host's stdout, or its rendered textual response |
+| `stderr` | the first 500 bytes of the host's stderr, `[truncated]` when cut |
+| `error` | the host's error message, when it sent one |
+
+`success: null` is a first-class value: an absent verdict is data, and
+recording it as `true` would make the store unable to answer whether anything
+ever failed. The rules that map host fields to these are in
+[hooks.md](hooks.md#outcomes-are-three-state).
+
+## What a `run.finished` payload records
+
+A run closed by `slod hook close` carries an `outcomes` object counting the
+trace it closes: `tool_calls`, `tool_results`, `unanswered_calls`,
+`succeeded`, `failed`, `unknown`, and `errors`. `unanswered_calls` — a
+`tool.call` with no matching `tool.result` — is the failure signal left behind
+by hosts that do not fire a post-tool hook when a tool fails.
+
+## Retention
+
+Traces are removed by `slod prune --older-than <days>`, which is a dry run
+unless `--apply` is passed. It only considers regular `*.slod` files and their
+`*.slod.lock` sidecars directly inside the run directory, never recurses, and
+never removes `ledger.slod`. Deleting a trace deletes evidence; the ledger
+stays rebuildable from whatever traces remain.
+
 ## Concurrent access and lock sidecars
 
 Each trace has a sibling coordination file named `<trace>.lock`. Slod may leave

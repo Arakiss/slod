@@ -186,7 +186,29 @@ slod hook install --print
 
 The wired command is `slod hook ingest --source generic --dir .slod/runs`:
 it derives the run id from the host session id and writes one
-`<run-id>.slod` per session. To capture a real agent session end to end
+`<run-id>.slod` per session.
+
+Wire the host's **session-ending** hook — not a per-turn one — to close the
+trace, so `slod verify` passes on the captured session:
+
+```bash
+slod hook close --source generic --dir .slod/runs
+```
+
+`hook close` is idempotent, never creates a trace, and records a census of what
+the session captured, including `tool.call` events that never received a
+`tool.result`. Outcomes on a `tool.result` are three-state: `true`, `false`, or
+`null` when the host reported nothing readable — slod never defaults a result to
+success. See [`docs/hooks.md`](docs/hooks.md).
+
+Keep the store bounded with a retention window; it is a dry run unless
+`--apply` is passed:
+
+```bash
+slod prune --dir .slod/runs --older-than 30
+```
+
+To capture a real agent session end to end
 (wire → run a real agent → verify → render), run
 [`scripts/capture-session.sh`](scripts/capture-session.sh) (set `AGENT_CMD` to
 launch your harness, or let it fall back to a `slod run` recording);
