@@ -10,6 +10,19 @@ while the public harness contract is still being proven.
 From this release onward the changelog is generated from Conventional Commits;
 new versions are appended above this entry automatically.
 
+## [0.2.1](https://github.com/Arakiss/slod/compare/v0.2.0...v0.2.1) (2026-09-30)
+
+
+### Features
+
+* **hook:** close captured sessions and bound the store with prune ([5d55069](https://github.com/Arakiss/slod/commit/5d55069bddf51033c2f89ea43ee8d196ffab7e59))
+
+
+### Bug fixes
+
+* **hook:** record a tool outcome instead of assuming success ([169b165](https://github.com/Arakiss/slod/commit/169b16509eff2720a5e132278a9e34f714562ec1))
+* **hook:** record a wrapped output stream as its text ([5b06b93](https://github.com/Arakiss/slod/commit/5b06b933b88eb7b2d1d7c68854cef4959108feab))
+
 ## [0.2.0](https://github.com/Arakiss/slod/compare/v0.1.2...v0.2.0) (2026-07-30)
 
 
