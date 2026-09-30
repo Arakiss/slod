@@ -215,16 +215,19 @@ fn map_tool_result(source: &str, hook_event: &str, payload: &Value) -> HookEvent
     insert_value(
         &mut out,
         "output",
-        value_field(
+        non_empty_value_field(
             payload,
             &[
                 "output",
                 "stdout",
                 "tool_response.output",
-                "tool_response.stdout",
+                // A stream reported as `{ "text": … }` is recorded as its
+                // text, not as the wrapper object a reader would have to
+                // unwrap, so the leaf is probed before the container.
                 "tool_response.stdout.text",
-                "tool_response.aggregated_output",
+                "tool_response.stdout",
                 "tool_response.aggregated_output.text",
+                "tool_response.aggregated_output",
                 "result.output",
                 "result.stdout",
             ],
@@ -636,6 +639,26 @@ fn value_exit_success(value: &Value) -> Option<bool> {
         Value::String(text) => text.parse::<i64>().ok().map(|code| code == 0),
         _ => None,
     }
+}
+
+/// Like [`value_field`], but an empty string does not win over a later path
+/// that has content. A host reporting an empty `stdout` alongside a populated
+/// `aggregated_output` should record the output that exists.
+fn non_empty_value_field(value: &Value, paths: &[&str]) -> Option<Value> {
+    paths
+        .iter()
+        .filter_map(|path| value_at(value, path))
+        .find(|value| match value {
+            Value::Null => false,
+            Value::String(text) => !text.is_empty(),
+            // A stream wrapper carrying an empty `text` is an empty stream.
+            Value::Object(object) => match object.get("text") {
+                Some(Value::String(text)) => !text.is_empty(),
+                _ => true,
+            },
+            _ => true,
+        })
+        .cloned()
 }
 
 fn value_field(value: &Value, paths: &[&str]) -> Option<Value> {

@@ -235,6 +235,11 @@ fn maps_a_structured_exec_result_with_exit_code_and_streams() {
         events[0].payload["stderr"],
         "ls: /nope: No such file or directory"
     );
+    // A `{ "text": … }` stream lands as its text, not as the wrapper object.
+    assert_eq!(
+        events[0].payload["output"],
+        "ls: /nope: No such file or directory"
+    );
 }
 
 #[test]
