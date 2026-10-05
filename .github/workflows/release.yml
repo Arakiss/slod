@@ -148,7 +148,7 @@ jobs:
             target: aarch64-apple-darwin
             asset: slod-aarch64-darwin
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           # On workflow_dispatch, check out the tag provided via input.
           ref: ${{ github.event.inputs.tag || github.ref }}
@@ -251,7 +251,7 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
       - name: Resolve and validate release tag
