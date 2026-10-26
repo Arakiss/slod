@@ -1,3 +1,6 @@
+> **Archived on 2026-10-26.**
+> slod recorded AI agent sessions as local, append-only traces. It is no longer used: the binary was retired in October 2026, and session analysis now reads the agents' own transcripts.
+
 <p align="center">
   <img src="assets/banner.svg?v=20260503-pipeline" alt="slod - inspectable traces for AI agent workflows" width="100%" />
 </p>
